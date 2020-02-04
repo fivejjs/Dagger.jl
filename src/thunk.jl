@@ -18,6 +18,7 @@ mutable struct Thunk
     cache_ref::Any
     affinity::Union{Nothing, Vector{Pair{OSProc, Int}}}
     options::Any # stores scheduler-specific options
+    dynamic::Bool
     function Thunk(f, xs...;
                    id::Int=next_id(),
                    get_result::Bool=false,
@@ -26,9 +27,11 @@ mutable struct Thunk
                    cache::Bool=false,
                    cache_ref=nothing,
                    affinity=nothing,
-                   options=nothing
+                   options=nothing,
+                   dynamic::Bool=false
                   )
-        new(f,xs,id,get_result,meta,persist, cache, cache_ref, affinity, options)
+        new(f, xs, id, get_result, meta, persist, cache, cache_ref, affinity,
+            options, dynamic)
     end
 end
 
@@ -109,4 +112,3 @@ inputs(x) = ()
 
 istask(x::Thunk) = true
 istask(x) = false
-

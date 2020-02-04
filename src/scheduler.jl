@@ -9,6 +9,80 @@ include("fault-handler.jl")
 
 const OneToMany = Dict{Thunk, Set{Thunk}}
 
+"A handle to the scheduler, used by dynamic thunks."
+struct SchedulerHandle
+    thunk_id::Int
+    out_chan::RemoteChannel
+    inp_chan::RemoteChannel
+end
+
+"Thrown when the scheduler halts before finishing processing the DAG."
+struct SchedulerHaltedException <: Exception end
+
+## Worker-side methods for dynamic communication
+
+"Sends arbitrary data to the scheduler."
+send!(h::SchedulerHandle, cmd, data) = put!(h.out_chan, (h.thunk_id, cmd, data))
+
+"Receives the next message from the scheduler."
+recv!(h::SchedulerHandle) = take!(h.inp_chan)
+
+"Commands the scheduler to halt execution immediately."
+function halt!(h::SchedulerHandle)
+    send!(h, :halt, nothing)
+    sleep(1)
+end
+
+"Returns all Thunks IDs as a Dict, mapping a Thunk to its inputs."
+get_dag_ids(h::SchedulerHandle) = (send!(h, :get_dag_ids, nothing); recv!(h))
+
+## Scheduler-side methods for dynamic communication
+
+# Fallback method
+function process_dynamic!(state, task, tid, cmd, data)
+    @warn "Received invalid dynamic command $cmd from thunk $tid: $data"
+    Base.throwto(task, SchedulerHaltedException())
+end
+
+function process_dynamic!(state, task, tid, cmd::Val{:halt}, _)
+    state.halt[] = true
+    Base.throwto(task, SchedulerHaltedException())
+end
+function safepoint(state, chan)
+    if state.halt[]
+        # Force dynamic thunks and listeners to terminate
+        for (inp_chan,out_chan) in values(state.worker_chans)
+            close(inp_chan)
+            close(out_chan)
+        end
+        # Throw out of scheduler
+        throw(SchedulerHaltedException())
+    end
+end
+
+function process_dynamic!(state, task, tid, cmd::Val{:get_dag_ids}, _)
+    deps = Dict{Int,Set{Int}}()
+    for (key,val) in state.dependents
+        deps[key.id] = Set(map(t->t.id, collect(val)))
+    end
+    deps
+end
+
+"Processes dynamic messages from worker-executing thunks."
+function dynamic_listener!(state)
+    task = current_task()
+    for tid in keys(state.worker_chans)
+        inp_chan, out_chan = state.worker_chans[tid]
+        @async begin
+            while isopen(inp_chan)
+                tid, cmd, data = take!(inp_chan)
+                res = process_dynamic!(state, task, tid, Val(cmd), data)
+                res !== nothing && put!(out_chan, res)
+            end
+        end
+    end
+end
+
 """
     ComputeState
 
@@ -23,6 +97,9 @@ Fields
 - cache::Dict{Thunk, Any} - Maps from a finished `Thunk` to it's cached result, often a DRef
 - running::Set{Thunk} - The set of currently-running `Thunk`s
 - thunk_dict::Dict{Int, Any} - Maps from thunk IDs to a `Thunk`
+- worker_chans::Dict{Int, Tuple{RemoteChannel,RemoteChannel}} - Communication channels between the scheduler and each worker
+- halt::Ref{Bool} - Flag indicating, when set, that the scheduler should halt immediately
+- lock::ReentrantLock() - Lock around operations which modify the state
 """
 struct ComputeState
     dependents::OneToMany
@@ -33,6 +110,9 @@ struct ComputeState
     cache::Dict{Thunk, Any}
     running::Set{Thunk}
     thunk_dict::Dict{Int, Any}
+    worker_chans::Dict{Int, Tuple{RemoteChannel,RemoteChannel}}
+    halt::Ref{Bool}
+    lock::ReentrantLock
 end
 
 """
@@ -94,15 +174,31 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
 
     node_order = x -> -get(ord, x, 0)
     state = start_state(deps, node_order)
+
+    # setup worker-to-scheduler channels
+    for p in ps
+        inp_chan = RemoteChannel(p.pid)
+        out_chan = RemoteChannel(p.pid)
+        state.worker_chans[p.pid] = (inp_chan, out_chan)
+    end
+
+    # setup dynamic listeners
+    @async dynamic_listener!(state)
+
+    @dbg timespan_end(ctx, :scheduler_init, 0, master)
+
     # start off some tasks
     for p in ps
         isempty(state.ready) && break
-        task = pop_with_affinity!(ctx, state.ready, p, false)
-        if task !== nothing
-            fire_task!(ctx, task, p, state, chan, node_order)
+        lock(state.lock) do
+            task = pop_with_affinity!(ctx, state.ready, p, false)
+            if task !== nothing
+                fire_task!(ctx, task, p, state, chan, node_order)
+            end
         end
     end
-    @dbg timespan_end(ctx, :scheduler_init, 0, master)
+
+    safepoint(state, chan)
 
     # Loop while we still have thunks to execute
     while !isempty(state.ready) || !isempty(state.running)
@@ -110,9 +206,11 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
             # Nothing running, so schedule up to N thunks, 1 per N workers
             for p in ps
                 isempty(state.ready) && break
-                task = pop_with_affinity!(ctx, state.ready, p, false)
-                if task !== nothing
-                    fire_task!(ctx, task, p, state, chan, node_order)
+                lock(state.lock) do
+                    task = pop_with_affinity!(ctx, state.ready, p, false)
+                    if task !== nothing
+                        fire_task!(ctx, task, p, state, chan, node_order)
+                    end
                 end
             end
         end
@@ -121,6 +219,8 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
             # the block above fired only meta tasks
             continue
         end
+
+        safepoint(state, chan)
 
         proc, thunk_id, res = take!(chan) # get result of completed thunk
         if isa(res, CapturedException) || isa(res, RemoteException)
@@ -131,7 +231,9 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
                 filter!(p->p.pid!=proc.pid, ctx.procs)
                 ps = procs(ctx)
 
+                lock(state.lock)
                 handle_fault(ctx, state, state.thunk_dict[thunk_id], proc, chan, node_order)
+                unlock(state.lock)
                 continue
             else
                 throw(res)
@@ -142,14 +244,18 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
         state.cache[node] = res
 
         @dbg timespan_start(ctx, :scheduler, thunk_id, master)
-        immediate_next = finish_task!(state, node, node_order)
-        if !isempty(state.ready)
-            thunk = pop_with_affinity!(Context(ps), state.ready, proc, immediate_next)
-            if thunk !== nothing
-                fire_task!(ctx, thunk, proc, state, chan, node_order)
+        lock(state.lock) do
+            immediate_next = finish_task!(state, node, node_order)
+            if !isempty(state.ready)
+                thunk = pop_with_affinity!(Context(ps), state.ready, proc, immediate_next)
+                if thunk !== nothing
+                    fire_task!(ctx, thunk, proc, state, chan, node_order)
+                end
             end
         end
         @dbg timespan_end(ctx, :scheduler, thunk_id, master)
+
+        safepoint(state, chan)
     end
     state.cache[d]
 end
@@ -261,7 +367,13 @@ function fire_task!(ctx, thunk, proc, state, chan, node_order)
     if options.single > 0
         proc = OSProc(options.single)
     end
-    async_apply(ctx, proc, thunk.id, thunk.f, data, chan, thunk.get_result, thunk.persist, thunk.cache, options)
+    sch_handle = if thunk.dynamic
+        SchedulerHandle(thunk.id, state.worker_chans[proc.pid]...)
+    else
+        nothing
+    end
+    async_apply(ctx, proc, thunk.id, thunk.f, data, chan, thunk.get_result,
+                thunk.persist, thunk.cache, options, sch_handle)
 end
 
 function finish_task!(state, node, node_order; free=true)
@@ -308,11 +420,17 @@ function start_state(deps::Dict, node_order)
                   Vector{Thunk}(undef, 0),
                   Dict{Thunk, Any}(),
                   Set{Thunk}(),
-                  Dict{Int, Thunk}()
+                  Dict{Int, Thunk}(),
+                  Dict{Int, Tuple{RemoteChannel,RemoteChannel}}(),
+                  Ref{Bool}(false),
+                  ReentrantLock()
                  )
 
     nodes = sort(collect(keys(deps)), by=node_order)
-    merge!(state.waiting_data, deps)
+    # N.B. Using merge! here instead would modify deps
+    for (key,val) in deps
+        state.waiting_data[key] = copy(val)
+    end
     for k in nodes
         if istask(k)
             waiting = Set{Thunk}(Iterators.filter(istask,
@@ -327,7 +445,10 @@ function start_state(deps::Dict, node_order)
     state
 end
 
-@noinline function do_task(ctx, proc, thunk_id, f, data, send_result, persist, cache, options)
+_move(ctx, to_proc, x) = x
+_move(ctx, to_proc::OSProc, x::Union{Chunk, Thunk}) = collect(ctx, x)
+
+@noinline function do_task(ctx, proc, thunk_id, f, data, send_result, persist, cache, options, sch_handle)
     @dbg timespan_start(ctx, :comm, thunk_id, proc)
     fetched = map(x->x isa Union{Chunk,Thunk} ? collect(ctx, x) : x, data)
     @dbg timespan_end(ctx, :comm, thunk_id, proc)
@@ -336,6 +457,9 @@ end
     from_proc = proc
     to_proc = choose_processor(from_proc, options, f, fetched)
     fetched = move.(Ref(ctx), Ref(from_proc), Ref(to_proc), fetched)
+    if sch_handle !== nothing
+        fetched = (sch_handle, fetched...) # prepend scheduler handle
+    end
     result_meta = try
         res = execute!(to_proc, f, fetched...)
         (from_proc, thunk_id, send_result ? res : tochunk(res, to_proc; persist=persist, cache=persist ? true : cache)) #todo: add more metadata
@@ -347,10 +471,12 @@ end
     result_meta
 end
 
-@noinline function async_apply(ctx, p::OSProc, thunk_id, f, data, chan, send_res, persist, cache, options)
+@noinline function async_apply(ctx, p::OSProc, thunk_id, f, data, chan, send_res, persist, cache, options, sch_handle)
     @async begin
         try
-            put!(chan, remotecall_fetch(do_task, p.pid, ctx, p, thunk_id, f, data, send_res, persist, cache, options))
+            put!(chan, remotecall_fetch(do_task, p.pid, ctx, p, thunk_id,
+                                        f, data, send_res, persist, cache,
+                                        options, sch_handle))
         catch ex
             bt = catch_backtrace()
             put!(chan, (p, thunk_id, CapturedException(ex, bt)))

@@ -1,6 +1,8 @@
-import Dagger.Sch: SchedulerOptions, ThunkOptions
+import Dagger.Sch: SchedulerOptions, ThunkOptions, SchedulerHaltedException
+import Dagger.Sch: halt!
 
 @everywhere begin
+using Dagger
 function inc(x)
     x+1
 end
@@ -11,6 +13,14 @@ end
 function checktid(x...)
     @assert Threads.threadid() != 1 || Threads.nthreads() == 1
     return 1
+end
+function dynamic_halt(h, x)
+    Dagger.Sch.halt!(h)
+    return x
+end
+function dynamic_get_dag(h, x...)
+    ids = Dagger.Sch.get_dag_ids(h)
+    return (h.thunk_id, ids)
 end
 end
 
@@ -66,4 +76,30 @@ end
     end
     @everywhere (pop!(Dagger.PROCESSOR_CALLBACKS); empty!(Dagger.OSPROC_CACHE))
 
+end
+
+@testset "Dynamic Thunks" begin
+    @testset "Scheduler control" begin
+        a = delayed(dynamic_halt; dynamic=true)(1)
+        @test_throws SchedulerHaltedException collect(Context(), a)
+    end
+    @testset "DAG querying" begin
+        a = delayed(identity)(1)
+        b = delayed(x->x+2)(a)
+        c = delayed(x->x-1)(a)
+        d = delayed(dynamic_get_dag; dynamic=true)(b, c)
+        (d_id, ids) = collect(Context(), d)
+        @test ids isa Dict
+        @test length(keys(ids)) == 4
+        @test haskey(ids, d_id)
+        d_deps = ids[d_id]
+        @test length(d_deps) == 0
+        a_id = d_id - 3 # relies on thunk ID monotonicity
+        a_deps = ids[a_id]
+        @test length(a_deps) == 2
+        i1, i2 =  pop!(a_deps), pop!(a_deps)
+        @test haskey(ids, i1)
+        @test haskey(ids, i2)
+        @test ids[pop!(ids[i1])] == ids[pop!(ids[i2])]
+    end
 end
