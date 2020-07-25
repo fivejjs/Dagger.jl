@@ -1,5 +1,4 @@
-import Dagger.Sch: SchedulerOptions, ThunkOptions, SchedulerHaltedException
-import Dagger.Sch: halt!
+import Dagger.Sch: SchedulerOptions, ThunkOptions, SchedulerHaltedException, ComputeState
 
 @everywhere begin
 using Dagger
@@ -13,6 +12,20 @@ end
 function checktid(x...)
     @assert Threads.threadid() != 1 || Threads.nthreads() == 1
     return 1
+end
+function dynamic_exec(h, x)
+    Dagger.Sch.exec!(h) do state
+        if state isa ComputeState
+            return 1
+        else
+            return 0
+        end
+    end
+end
+function dynamic_exec_err(h, x)
+    Dagger.Sch.exec!(h) do state
+        error("An error")
+    end
 end
 function dynamic_halt(h, x)
     Dagger.Sch.halt!(h)
@@ -79,7 +92,15 @@ end
 end
 
 @testset "Dynamic Thunks" begin
-    @testset "Scheduler control" begin
+    @testset "Exec" begin
+        a = delayed(dynamic_exec; dynamic=true)(2)
+        @test collect(Context(), a) == 1
+    end
+    @testset "Exec Error" begin
+        a = delayed(dynamic_exec_err; dynamic=true)(1)
+        @test_throws RemoteException collect(Context(), a)
+    end
+    @testset "Halt" begin
         a = delayed(dynamic_halt; dynamic=true)(1)
         @test_throws SchedulerHaltedException collect(Context(), a)
     end

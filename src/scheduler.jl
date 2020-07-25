@@ -27,6 +27,16 @@ send!(h::SchedulerHandle, cmd, data) = put!(h.out_chan, (h.thunk_id, cmd, data))
 "Receives the next message from the scheduler."
 recv!(h::SchedulerHandle) = take!(h.inp_chan)
 
+"Executes an arbitrary function within the scheduler, returning the result."
+function exec!(f, h::SchedulerHandle)
+    send!(h, :exec, f)
+    failed, res = recv!(h)
+    if failed
+        throw(res)
+    end
+    res
+end
+
 "Commands the scheduler to halt execution immediately."
 function halt!(h::SchedulerHandle)
     send!(h, :halt, nothing)
@@ -43,7 +53,16 @@ function process_dynamic!(state, task, tid, cmd, data)
     @warn "Received invalid dynamic command $cmd from thunk $tid: $data"
     Base.throwto(task, SchedulerHaltedException())
 end
-
+function process_dynamic!(state, task, tid, cmd::Val{:exec}, f)
+    try
+        res = lock(state.lock) do
+            Base.invokelatest(f, state)
+        end
+        return (false, res)
+    catch err
+        return (true, err)
+    end
+end
 function process_dynamic!(state, task, tid, cmd::Val{:halt}, _)
     state.halt[] = true
     Base.throwto(task, SchedulerHaltedException())
