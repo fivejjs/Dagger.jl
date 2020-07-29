@@ -1,17 +1,4 @@
 """
-    check_exited_exception(res::Exception) -> Bool
-
-Recursively checks if an exception was caused by a worker exiting.
-"""
-check_exited_exception(res::CapturedException) =
-    check_exited_exception(res.ex)
-check_exited_exception(res::RemoteException) =
-    check_exited_exception(res.captured)
-check_exited_exception(res::ProcessExitedException) = true
-check_exited_exception(res::Base.IOError) = true
-check_exited_exception(res) = false
-
-"""
     handle_fault(...)
 
 An internal function to handle a worker dying or being killed by the OS.

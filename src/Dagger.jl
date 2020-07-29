@@ -23,7 +23,7 @@ include("chunks.jl")
 
 # Task scheduling
 include("compute.jl")
-include("scheduler.jl")
+include("sch/Sch.jl")
 
 # Array computations
 include("array/darray.jl")

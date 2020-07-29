@@ -35,6 +35,14 @@ function dynamic_get_dag(h, x...)
     ids = Dagger.Sch.get_dag_ids(h)
     return (h.thunk_id, ids)
 end
+import Dagger.Sch: Arg
+function dynamic_add_thunk(h, x)
+    id = Dagger.Sch.add_thunk!(h, Arg(x)) do y
+        y+1
+    end
+    Dagger.Sch.set_return!(h, id)
+    return id
+end
 end
 
 @testset "Scheduler" begin
@@ -122,5 +130,10 @@ end
         @test haskey(ids, i1)
         @test haskey(ids, i2)
         @test ids[pop!(ids[i1])] == ids[pop!(ids[i2])]
+    end
+    @testset "Add Thunk" begin
+        a = delayed(dynamic_add_thunk; dynamic=true)(1)
+        res = collect(Context(), a)
+        @test res == 2
     end
 end

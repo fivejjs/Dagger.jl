@@ -5,102 +5,11 @@ import MemPool: DRef
 
 import ..Dagger: Context, Processor, Thunk, Chunk, OSProc, order, free!, dependents, noffspring, istask, inputs, affinity, tochunk, @dbg, @logmsg, timespan_start, timespan_end, unrelease, procs, move, choose_processor, execute!
 
-include("fault-handler.jl")
-
 const OneToMany = Dict{Thunk, Set{Thunk}}
 
-"A handle to the scheduler, used by dynamic thunks."
-struct SchedulerHandle
-    thunk_id::Int
-    out_chan::RemoteChannel
-    inp_chan::RemoteChannel
-end
-
-"Thrown when the scheduler halts before finishing processing the DAG."
-struct SchedulerHaltedException <: Exception end
-
-## Worker-side methods for dynamic communication
-
-"Sends arbitrary data to the scheduler."
-send!(h::SchedulerHandle, cmd, data) = put!(h.out_chan, (h.thunk_id, cmd, data))
-
-"Receives the next message from the scheduler."
-recv!(h::SchedulerHandle) = take!(h.inp_chan)
-
-"Executes an arbitrary function within the scheduler, returning the result."
-function exec!(f, h::SchedulerHandle)
-    send!(h, :exec, f)
-    failed, res = recv!(h)
-    if failed
-        throw(res)
-    end
-    res
-end
-
-"Commands the scheduler to halt execution immediately."
-function halt!(h::SchedulerHandle)
-    send!(h, :halt, nothing)
-    sleep(1)
-end
-
-"Returns all Thunks IDs as a Dict, mapping a Thunk to its inputs."
-get_dag_ids(h::SchedulerHandle) = (send!(h, :get_dag_ids, nothing); recv!(h))
-
-## Scheduler-side methods for dynamic communication
-
-# Fallback method
-function process_dynamic!(state, task, tid, cmd, data)
-    @warn "Received invalid dynamic command $cmd from thunk $tid: $data"
-    Base.throwto(task, SchedulerHaltedException())
-end
-function process_dynamic!(state, task, tid, cmd::Val{:exec}, f)
-    try
-        res = lock(state.lock) do
-            Base.invokelatest(f, state)
-        end
-        return (false, res)
-    catch err
-        return (true, err)
-    end
-end
-function process_dynamic!(state, task, tid, cmd::Val{:halt}, _)
-    state.halt[] = true
-    Base.throwto(task, SchedulerHaltedException())
-end
-function safepoint(state, chan)
-    if state.halt[]
-        # Force dynamic thunks and listeners to terminate
-        for (inp_chan,out_chan) in values(state.worker_chans)
-            close(inp_chan)
-            close(out_chan)
-        end
-        # Throw out of scheduler
-        throw(SchedulerHaltedException())
-    end
-end
-
-function process_dynamic!(state, task, tid, cmd::Val{:get_dag_ids}, _)
-    deps = Dict{Int,Set{Int}}()
-    for (key,val) in state.dependents
-        deps[key.id] = Set(map(t->t.id, collect(val)))
-    end
-    deps
-end
-
-"Processes dynamic messages from worker-executing thunks."
-function dynamic_listener!(state)
-    task = current_task()
-    for tid in keys(state.worker_chans)
-        inp_chan, out_chan = state.worker_chans[tid]
-        @async begin
-            while isopen(inp_chan)
-                tid, cmd, data = take!(inp_chan)
-                res = process_dynamic!(state, task, tid, Val(cmd), data)
-                res !== nothing && put!(out_chan, res)
-            end
-        end
-    end
-end
+include("util.jl")
+include("fault-handler.jl")
+include("dynamic.jl")
 
 """
     ComputeState
@@ -119,6 +28,7 @@ Fields
 - worker_chans::Dict{Int, Tuple{RemoteChannel,RemoteChannel}} - Communication channels between the scheduler and each worker
 - halt::Ref{Bool} - Flag indicating, when set, that the scheduler should halt immediately
 - lock::ReentrantLock() - Lock around operations which modify the state
+- return_thunk::Ref{Thunk} - The Thunk that `compute_dag` will return the value of
 """
 struct ComputeState
     dependents::OneToMany
@@ -132,6 +42,7 @@ struct ComputeState
     worker_chans::Dict{Int, Tuple{RemoteChannel,RemoteChannel}}
     halt::Ref{Bool}
     lock::ReentrantLock
+    return_thunk::Ref{Thunk}
 end
 
 """
@@ -193,6 +104,7 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
 
     node_order = x -> -get(ord, x, 0)
     state = start_state(deps, node_order)
+    state.return_thunk[] = d
 
     # setup worker-to-scheduler channels
     for p in ps
@@ -243,7 +155,7 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
 
         proc, thunk_id, res = take!(chan) # get result of completed thunk
         if isa(res, CapturedException) || isa(res, RemoteException)
-            if check_exited_exception(res)
+            if unwrap_nested_exception(res) isa Union{ProcessExitedException, Base.IOError}
                 @warn "Worker $(proc.pid) died on thunk $thunk_id, rescheduling work"
 
                 # Remove dead worker from procs list
@@ -276,7 +188,7 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
 
         safepoint(state, chan)
     end
-    state.cache[d]
+    state.cache[state.return_thunk[]]
 end
 
 function pop_with_affinity!(ctx, tasks, proc, immediate_next)
@@ -442,7 +354,8 @@ function start_state(deps::Dict, node_order)
                   Dict{Int, Thunk}(),
                   Dict{Int, Tuple{RemoteChannel,RemoteChannel}}(),
                   Ref{Bool}(false),
-                  ReentrantLock()
+                  ReentrantLock(),
+                  Ref{Thunk}()
                  )
 
     nodes = sort(collect(keys(deps)), by=node_order)
