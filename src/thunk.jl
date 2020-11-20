@@ -7,7 +7,7 @@ end
 
 # A thing to run
 mutable struct Thunk
-    f::Function
+    f::Any # usually a Function, but could be any callable
     inputs::Tuple
     id::Int
     get_result::Bool # whether the worker should send the result or only the metadata
@@ -74,6 +74,40 @@ function delayed(f; kwargs...)
 end
 
 delayedmap(f, xs...) = map(delayed(f), xs...)
+
+"""
+    @par f(args...) -> Thunk
+
+Convenience macro to call `Dagger.delayed` on `f` with arguments `args`.
+May also be called with a series of assignments like so:
+
+```julia
+x = @par begin
+    a = f(1,2)
+    b = g(a,3)
+    h(a,b)
+end
+```
+
+`x` will hold the Thunk representing `h(a,b)`; additionally, `a` and `b`
+will be defined in the same local scope and will be equally accessible
+for later calls.
+"""
+macro par(ex)
+    _par(ex)
+end
+function _par(ex::Expr)
+    if ex.head == :call
+        f = ex.args[1]
+        args = ex.args[2:end]
+        # TODO: Support kwargs
+        return :(Dagger.delayed($(esc(f)))($(_par.(args)...)))
+    else
+        return Expr(ex.head, _par.(ex.args)...)
+    end
+end
+_par(ex::Symbol) = esc(ex)
+_par(ex) = ex
 
 persist!(t::Thunk) = (t.persist=true; t)
 cache_result!(t::Thunk) = (t.cache=true; t)

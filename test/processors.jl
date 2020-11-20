@@ -76,4 +76,37 @@ end
             @everywhere pop!(Dagger.PROCESSOR_CALLBACKS)
         end
     end
+
+    @testset "Modify workers in Context" begin
+        ps = addprocs(4, exeflags="--project")
+        @everywhere ps using Dagger
+
+        ctx = Context(ps[1:2])
+
+        Dagger.addprocs!(ctx, ps[3:end])
+        @test map(p -> p.pid, procs(ctx)) == ps
+
+        Dagger.rmprocs!(ctx, ps[3:end])
+        @test map(p -> p.pid, procs(ctx)) == ps[1:2]
+
+        wait(rmprocs(ps))
+    end
+
+    @testset "Callable as Thunk function" begin
+        @everywhere begin
+            struct ABC end
+            (::ABC)(x) = x+1
+        end
+
+        abc = ABC()
+        a = delayed(abc)(1)
+        @test collect(a) == 2
+    end
+  
+    @testset "Processor TLS accessor" begin
+        @everywhere function mythunk(x)
+            typeof(Dagger.thunk_processor())
+        end
+        @test collect(delayed(mythunk)(1)) === ThreadProc
+    end
 end

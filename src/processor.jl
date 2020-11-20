@@ -1,4 +1,4 @@
-export OSProc, Context
+export OSProc, Context, addprocs!, rmprocs!
 
 """
     Processor
@@ -124,6 +124,13 @@ function move_to_osproc(parent_proc, x)
 end
 
 """
+    capacity(proc::Processor=OSProc()) -> Int
+
+Returns the total processing capacity of `proc`.
+"""
+capacity(proc=OSProc()) = length(get_processors(proc))
+
+"""
     OSProc <: Processor
 
 Julia CPU (OS) process, identified by Distributed pid. Executes thunks when
@@ -222,10 +229,16 @@ iscompatible_arg(proc::ThreadProc, opts, x) = true
 move(from_proc::OSProc, to_proc::ThreadProc, x) = x
 move(from_proc::ThreadProc, to_proc::OSProc, x) = x
 @static if VERSION >= v"1.3.0-DEV.573"
-    execute!(proc::ThreadProc, f, args...) = fetch(Threads.@spawn f(args...))
+    execute!(proc::ThreadProc, f, args...) = fetch(Threads.@spawn begin
+        task_local_storage(:processor, proc)
+        f(args...)
+    end)
 else
     # TODO: Use Threads.@threads?
-    execute!(proc::ThreadProc, f, args...) = fetch(@async f(args...))
+    execute!(proc::ThreadProc, f, args...) = fetch(@async begin
+        task_local_storage(:processor, proc)
+        f(args...)
+    end)
 end
 get_parent(proc::ThreadProc) = OSProc(proc.owner)
 default_enabled(proc::ThreadProc) = true
@@ -235,7 +248,9 @@ default_enabled(proc::ThreadProc) = true
 "A context represents a set of processors to use for an operation."
 mutable struct Context
     procs::Vector{Processor}
+    proc_lock::ReentrantLock
     log_sink::Any
+    log_file::Union{String,Nothing}
     profile::Bool
     options
 end
@@ -252,16 +267,23 @@ number of threads.
 It is also possible to create a Context from a vector of [`OSProc`](@ref),
 or equivalently the underlying process ids can also be passed directly
 as a `Vector{Int}`.
+
+Special fields include:
+- 'log_sink': A log sink object to use, if any.
+- `log_file::Union{String,Nothing}`: Path to logfile. If specified, at
+scheduler termination logs will be collected, combined with input thunks, and
+written out in DOT format to this location.
+- `profile::Bool`: Whether or not to perform profiling with Profile stdlib.
 """
-function Context(xs)
-    Context(xs, NoOpLog(), false, nothing) # By default don't log events
-end
+Context(procs::Vector{P}=Processor[OSProc(w) for w in workers()];
+        proc_lock=ReentrantLock(), log_sink=NoOpLog(), log_file=nothing,
+        profile=false, options=nothing) where {P<:Processor} =
+    Context(procs, proc_lock, log_sink, log_file, profile, options)
 Context(xs::Vector{Int}) = Context(map(OSProc, xs))
-function Context()
-    procs = [OSProc(w) for w in workers()]
-    Context(procs)
+Context() = Context([OSProc(w) for w in workers()])
+procs(ctx::Context) = lock(ctx) do
+    copy(ctx.procs)
 end
-procs(ctx::Context) = ctx.procs
 
 """
     write_event(ctx::Context, event::Event)
@@ -271,3 +293,41 @@ Write a log event
 function write_event(ctx::Context, event::Event)
     write_event(ctx.log_sink, event)
 end
+
+"""
+    lock(f, ctx::Context)
+
+Acquire `ctx.proc_lock`, execute `f` with the lock held, and release the lock when `f` returns.
+"""
+Base.lock(f, ctx::Context) = lock(f, ctx.proc_lock)
+
+"""
+    addprocs!(ctx::Context, xs)
+
+Add new workers `xs` to `ctx`.
+
+Workers will typically be assigned new tasks in the next scheduling iteration if scheduling is ongoing.
+
+Workers can be either `Processor`s or the underlying process IDs as `Integer`s.
+"""
+addprocs!(ctx::Context, xs::AbstractVector{<:Integer}) = addprocs!(ctx, map(OSProc, xs))
+addprocs!(ctx::Context, xs::AbstractVector{<:Processor}) = lock(ctx) do
+    append!(ctx.procs, xs)
+end
+
+"""
+    rmprocs!(ctx::Context, xs)
+
+Remove the specified workers `xs` from `ctx`.
+
+Workers will typically finish all their assigned tasks if scheduling is ongoing but will not be assigned new tasks after removal.
+
+Workers can be either `Processor`s or the underlying process IDs as `Integer`s.
+"""
+rmprocs!(ctx::Context, xs::AbstractVector{<:Integer}) = rmprocs!(ctx, map(OSProc, xs))
+rmprocs!(ctx::Context, xs::AbstractVector{<:Processor}) = lock(ctx) do
+    filter!(p -> p ∉ xs, ctx.procs)
+end
+
+"Gets the current processor executing the current thunk."
+thunk_processor() = task_local_storage(:processor)::Processor

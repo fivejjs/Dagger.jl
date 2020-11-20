@@ -1,11 +1,12 @@
 using Distributed
-addprocs(2)
+addprocs(3)
 
 using Test
 using Dagger
 
 include("fakeproc.jl")
 
+include("thunk.jl")
 include("domain.jl")
 include("array.jl")
 include("scheduler.jl")

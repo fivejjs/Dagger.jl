@@ -36,9 +36,11 @@ end
     r = collect(R)
     @test r[1:10] != r[11:20]
 end
-@testset "sum(ones(...))" begin
+@testset "sum" begin
     X = ones(Blocks(10, 10), 100, 100)
     @test sum(X) == 10000
+    Y = zeros(Blocks(10, 10), 100, 100)
+    @test sum(Y) == 0
 end
 
 @testset "distributing an array" begin
@@ -95,6 +97,13 @@ end
     X = Distribute(Blocks(3,3), x)
     y = rand(10)
     @test norm(collect(X*y) - x*y) < 1e-13
+end
+
+@testset "matrix powers" begin
+    x = compute(rand(Blocks(4,4), 16, 16))
+    @test collect(x^1) == collect(x)
+    @test collect(x^2) == collect(x*x)
+    @test collect(x^3) == collect(x*x*x)
 end
 
 @testset "concat" begin
